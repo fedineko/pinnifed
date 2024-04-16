@@ -11,12 +11,14 @@ use crate::{
     ConstructData,
     HttpContext,
     HttpMethod,
+    KeyDetails,
+    KeyDetailsError,
     ReconstructData,
     SignatureBaseConstructor,
     SignatureHeaders,
     SignatureProtocolHint,
     SignContext,
-    VerifyContext
+    VerifyContext,
 };
 
 use crate::signature::Signature;
@@ -168,13 +170,16 @@ impl SignatureBaseConstructor for Rfc9421BaseConstructor {
 
         let base = Self::merge_to_signature_base(component_lines, &signature_params);
 
+        let key_details = KeyDetails {
+            key_id,
+            key_alg,
+        };
 
         Some(
             ReconstructData {
                 signature_base: base,
                 signature: signature.value,
-                key_id,
-                key_alg,
+                key_details,
             }
         )
     }
@@ -246,6 +251,40 @@ impl SignatureBaseConstructor for Rfc9421BaseConstructor {
             SignatureProtocolHint::NoHint
         }
     }
+
+    fn key_details_from_headers(
+        &self,
+        headers: &HashMap<&str, &str>,
+    ) -> Result<KeyDetails, KeyDetailsError> {
+        let signature_input_header = match headers.get("signature-input") {
+            None => return Err(KeyDetailsError::UnknownSignature),
+            Some(value) => value,
+        };
+
+        let signature_input = match SignatureInput::parse(signature_input_header) {
+            None => return Err(
+                KeyDetailsError::MalformedSignature(signature_input_header.to_string())
+            ),
+            Some(value) => value,
+        };
+
+        let key_id = match signature_input.parameter_as_str("keyid") {
+            None => return Err(
+                KeyDetailsError::MalformedSignature(signature_input_header.to_string())
+            ),
+            Some(value) => value.to_string()
+        };
+
+        let key_alg = signature_input.parameter_as_str("alg")
+            .map(|s| s.to_string());
+
+        Ok(
+            KeyDetails {
+                key_id,
+                key_alg,
+            }
+        )
+    }
 }
 
 impl Default for Rfc9421BaseConstructor {
@@ -288,7 +327,7 @@ mod test {
             http_method: HttpMethod::Post,
             key_id: "test-key-rsa-pss",
             key_alg: "rsa-sha256",
-            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint()
+            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint(),
         };
 
         let signature = "test string".as_bytes().to_vec();
@@ -309,7 +348,7 @@ mod test {
             headers,
             target: &target,
             http_method: HttpMethod::Post,
-            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint()
+            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint(),
         };
 
         let reconstruct_base = base_constructor.reconstruct(
@@ -317,7 +356,7 @@ mod test {
         ).unwrap();
 
         assert_eq!(reconstruct_base.signature, signature);
-        assert_eq!(reconstruct_base.key_alg, Some(sign_context.key_alg.to_string()));
+        assert_eq!(reconstruct_base.key_details.key_alg, Some(sign_context.key_alg.to_string()));
         assert_eq!(reconstruct_base.signature_base, constructed_base);
     }
 
@@ -352,7 +391,7 @@ mod test {
             ]),
             target: &target,
             http_method: HttpMethod::Post,
-            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint()
+            signature_protocol_hint: SignatureProtocolHint::rfc9421_hint(),
         };
 
         let reconstruct_data = base_constructor.reconstruct(&verify_context);

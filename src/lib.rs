@@ -46,6 +46,29 @@ impl SignatureProtocolHint {
     }
 }
 
+/// Represents key details used to select appropriate key
+/// to verify messages.
+pub struct KeyDetails {
+    /// ID of the key to use for signature verification.
+    key_id: String,
+    /// Algorithm of the key to us for signature verification.
+    key_alg: Option<String>,
+}
+
+impl KeyDetails {
+    /// Returns key ID.
+    pub fn id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Returns key algorithm to use as a hint
+    /// when loading key.
+    pub fn alg(&self) -> Option<&str> {
+        self.key_alg.as_ref()
+            .map(|s| s.as_str())
+    }
+}
+
 /// Context shared between [SignContext] and [VerifyContext].
 pub trait HttpContext {
     /// Returns headers captured in context.
@@ -137,10 +160,8 @@ pub struct ReconstructData {
     /// Extracted from request data signature.
     /// It is actual signature, not Base64 encoded value.
     pub signature: Vec<u8>,
-    /// ID of the key to use for signature verification.
-    pub key_id: String,
-    /// Algorithm of the key to us for signature verification.
-    pub key_alg: Option<String>,
+    /// Details of key to use for signature verification.
+    pub key_details: KeyDetails,
 }
 
 /// This structure is returned on base construct call.
@@ -157,6 +178,23 @@ pub struct ConstructData {
 /// Purpose is to keep new headers used for signature related data.
 pub struct SignatureHeaders {
     pub headers: Vec<(&'static str, String)>,
+}
+
+/// Error produced when extracting key details from signature.
+#[derive(Debug)]
+pub enum KeyDetailsError {
+    /// Could not find signature details, either it does not exist
+    /// or protocol/format is not supported.
+    UnknownSignature,
+
+    /// Signature for supported protocol/spec does exist
+    /// but something is not right and parser fails.
+    MalformedSignature(String),
+
+    /// Signature seems to match known spec but base constructor
+    /// failed to extract key details which usually means there is
+    /// some issue with signature data itself.
+    NoKeyDetails(String),
 }
 
 /// This trait defines methods all base constructors need to implement.
@@ -195,6 +233,13 @@ pub trait SignatureBaseConstructor: std::fmt::Debug {
     /// If yes, returns appropriate `SignatureProtocolHint::Hint`
     /// used to select sign or verify implementations.
     fn protocol_hint(&self, headers: &HashMap<&str, &str>) -> SignatureProtocolHint;
+
+    /// Returns key details from `headers` if any so caller could
+    /// obtain public key for verification purposes.
+    fn key_details_from_headers(
+        &self,
+        headers: &HashMap<&str, &str>
+    ) -> Result<KeyDetails, KeyDetailsError>;
 }
 
 /// This function returns default signature base constructor.

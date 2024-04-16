@@ -3,12 +3,15 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use log::{debug, error, warn};
 use regex::{Regex, RegexBuilder};
+use once_cell::sync::Lazy;
 
 use crate::{
     ConstructData,
     HttpMethod,
-    SignatureProtocolHint,
+    KeyDetails,
+    KeyDetailsError,
     ReconstructData,
+    SignatureProtocolHint,
     SignatureBaseConstructor,
     SignatureHeaders,
     SignContext,
@@ -22,7 +25,48 @@ const ACCEPT_HEADER_VALUE: &str = "application/activity+json, application/ld+jso
 /// according to pre-standardised versions of RFC 9421.
 #[derive(Debug)]
 pub struct LegacySignatureBaseConstructor {
-    key_value_regex: Regex,
+}
+
+struct SignatureParameters {
+    signature_input: String,
+    parameters: HashMap<String, String>,
+}
+
+static KEY_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| RegexBuilder::new(
+    "^([a-z0-9.-]+)=\"(.+)\"$")
+    .case_insensitive(true)
+    .build()
+    .unwrap()
+);
+
+impl SignatureParameters {
+    fn new(signature_input: String) -> Self {
+        signature_input.match_indices(',');
+
+        let parameters = signature_input.split(',')
+            .map(|s| s.trim())
+            .filter_map(|kv| {
+                KEY_VALUE_REGEX.captures(kv)
+            })
+            .map(|capture| (
+                capture.get(1).unwrap().as_str().to_owned(),
+                capture.get(2).unwrap().as_str().to_owned()
+            ))
+            .collect();
+
+        Self {
+            parameters,
+            signature_input: signature_input.clone(),
+        }
+    }
+
+    pub fn input(&self) -> &str {
+        &self.signature_input
+    }
+
+    pub fn parameter(&self, name: &str) -> Option<&str> {
+        self.parameters.get(name).map(|s| s.as_str())
+    }
 }
 
 impl Default for LegacySignatureBaseConstructor {
@@ -34,13 +78,7 @@ impl Default for LegacySignatureBaseConstructor {
 impl LegacySignatureBaseConstructor {
     /// Returns new instance of legacy signature base constructor.
     pub fn new() -> Self {
-        Self {
-            key_value_regex: RegexBuilder::new(
-                "^([a-z0-9.-]+)=\"(.+)\"$")
-                .case_insensitive(true)
-                .build()
-                .unwrap()
-        }
+        Self {}
     }
 
     /// Helper method to produce signature base lines for `components`.
@@ -61,8 +99,6 @@ impl LegacySignatureBaseConstructor {
 
     /// Helper method to construct base for a give timestamp `now`, message `digest`,
     /// `target` URL accessed with `http_method`.
-    ///
-    /// TODO: make it private
     fn construct_with_date(
         &self,
         now: &str,
@@ -89,8 +125,6 @@ impl LegacySignatureBaseConstructor {
                         ("Host", target.host().unwrap().to_string()),
                         ("Digest", digest.to_string()),
                         ("Date", now.to_string()),
-                        // TODO: should not be set here, should be controlled by client.
-                        ("Accept", ACCEPT_HEADER_VALUE.to_string()),
                     ],
                 }
             }
@@ -115,20 +149,38 @@ impl LegacySignatureBaseConstructor {
         }
     }
 
-    /// Helper method to reduce boilerplate on accessing `key`
-    /// in `signature_parameters` map of values extracted from
-    /// 'signature' header.
-    fn get_parameter<'a>(
-        signature_parameters: &HashMap<&str, &'a str>,
-        key: &str,
-    ) -> Option<&'a str> {
-        match signature_parameters.get(key) {
-            None => {
-                error!("'signature' header does not include '{key}' parameter");
-                None
-            }
-            Some(value) => Some(*value)
-        }
+    /// This method returns [SignatureParameters] extracted from `headers` on success,
+    /// empty [Option] otherwise.
+    fn signature_parameters(
+        &self,
+        headers: &HashMap<&str, &str>
+    ) -> Option<SignatureParameters> {
+        let signature_input = headers.get("signature")
+            .map(|s| s.to_string())?;
+
+        Some(SignatureParameters::new(signature_input))
+    }
+
+    /// Returns key details from parameters of earlier extracted `signature_parameters`
+    fn key_details(
+        &self,
+        signature_parameters: &SignatureParameters,
+    ) -> Result<KeyDetails, KeyDetailsError> {
+        let key_id = match signature_parameters.parameter("keyId") {
+            None => return Err(
+                KeyDetailsError::NoKeyDetails(signature_parameters.input().to_string())
+            ),
+            Some(value) => value.to_string(),
+        };
+
+        // Algorithm identification label might not be present.
+        let key_alg = signature_parameters.parameter("algorithm")
+            .map(|alg| alg.to_string());
+
+        Ok(KeyDetails {
+            key_id,
+            key_alg,
+        })
     }
 }
 
@@ -137,8 +189,7 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
         &self,
         verify_context: &VerifyContext,
     ) -> Option<ReconstructData> {
-        let signature_header = verify_context.headers.get("signature")
-            .map(|s| s.to_string())?;
+        let signature_parameters = self.signature_parameters(&verify_context.headers)?;
 
         let mut headers: HashMap<&str, &str> = verify_context.headers.iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
@@ -152,30 +203,13 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
 
         headers.insert("(request-target)", &request_target);
 
-        let signature_parameters: HashMap<_, _> = signature_header.split(',')
-            .map(|s| s.trim())
-            .filter_map(|kv| {
-                self.key_value_regex.captures(kv)
-            })
-            .map(|capture| (
-                capture.get(1).unwrap().as_str(),
-                capture.get(2).unwrap().as_str()
-            ))
-            .collect();
-
-        let base = signature_parameters.get("headers")
+        let signature_base = signature_parameters.parameter("headers")
             .map(|headers| headers.split(' ').collect::<Vec<_>>())
             .map(|hints| self.signed_string_from_headers(hints, headers))?;
 
-        let signature = Self::get_parameter(&signature_parameters, "signature")?;
+        let signature = signature_parameters.parameter("signature")?;
 
-        let key_id = Self::get_parameter(&signature_parameters, "keyId")?
-            .to_string();
-
-        let key_alg = Self::get_parameter(&signature_parameters, "algorithm")
-            .map(|alg| alg.to_string());
-
-        let signature = match BASE64_STANDARD.decode(signature) {
+        let signature = match BASE64_STANDARD.decode(signature.as_bytes()) {
             Ok(bytes) => bytes,
             Err(err) => {
                 warn!("Failed to decode signature {:?}: {err:?}", signature);
@@ -183,12 +217,21 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
             }
         };
 
-        Some(ReconstructData {
-            signature_base: base,
-            signature,
-            key_id,
-            key_alg,
-        })
+        let key_details = match self.key_details(&signature_parameters) {
+            Ok(key_details) => key_details,
+            Err(err) => {
+                error!("Failed to extract key details: {err:?}");
+                return None;
+            }
+        };
+
+        Some(
+            ReconstructData {
+                signature_base,
+                signature,
+                key_details,
+            }
+        )
     }
 
     fn construct(
@@ -222,7 +265,9 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
             Some(value) => *value,
         };
 
-        if !sign_context.headers.contains_key("accept") {
+        if !sign_context.headers.contains_key("accept") &&
+            sign_context.http_method == HttpMethod::Get
+        {
             error!("'accept' header must be set before calling legacy construct()");
             return None;
         }
@@ -240,6 +285,13 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
     ) -> SignatureHeaders {
         let encoded_signature = BASE64_STANDARD.encode(signature);
 
+        // HACK: legacy base constructor uses a slightly different
+        //       labels for supported algorithms.
+        let key_alg = match sign_context.key_alg {
+            "rsa-v1_5-sha256" => "rsa-sha256",
+            _ => sign_context.key_alg,
+        };
+
         let signature_header = match construct_base_data.http_method {
             HttpMethod::Post => {
                 format!(
@@ -248,7 +300,7 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
                     headers=\"(request-target) host date digest\"\
                     ,signature=\"{encoded_signature}\"",
                     sign_context.key_id,
-                    sign_context.key_alg,
+                    key_alg,
                 )
             }
 
@@ -259,7 +311,7 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
                     headers=\"(request-target) host date accept\",\
                     signature=\"{encoded_signature}\"",
                     sign_context.key_id,
-                    sign_context.key_alg,
+                    key_alg,
                 )
             }
         };
@@ -281,5 +333,17 @@ impl SignatureBaseConstructor for LegacySignatureBaseConstructor {
             true => SignatureProtocolHint::Hint("pre-rfc9421"),
             false => SignatureProtocolHint::NoHint,
         }
+    }
+
+    fn key_details_from_headers(
+        &self,
+        headers: &HashMap<&str, &str>,
+    ) -> Result<KeyDetails, KeyDetailsError> {
+        let signature_parameters = match self.signature_parameters(headers) {
+            None => return Err(KeyDetailsError::UnknownSignature),
+            Some(value) => value,
+        };
+
+        self.key_details(&signature_parameters)
     }
 }

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use crate::{
     ConstructData,
+    KeyDetails,
+    KeyDetailsError,
     ReconstructData,
     SignatureBaseConstructor,
     SignatureHeaders,
@@ -100,12 +102,21 @@ impl SignatureBaseConstructor for GuessingBaseConstructor {
 
         SignatureProtocolHint::NoHint
     }
+
+    fn key_details_from_headers(
+        &self,
+        headers: &HashMap<&str, &str>,
+    ) -> Result<KeyDetails, KeyDetailsError> {
+        let protocol_hint = self.protocol_hint(headers);
+        let constructor = self.select_constructor(protocol_hint);
+
+        constructor.key_details_from_headers(headers)
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
-    use std::ptr;
     use crate::{SignatureBaseConstructor, SignatureProtocolHint};
     use crate::wrapper::GuessingBaseConstructor;
 
